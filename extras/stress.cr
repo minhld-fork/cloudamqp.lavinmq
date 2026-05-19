@@ -48,6 +48,7 @@ module Stress
   class Stats
     {% for name in %w(
                      published acked nacked rejected dead_lettered get_ok get_empty
+                     confirmed confirm_nacked confirm_timeouts confirm_disconnects batch_confirm_cycles
                      bindings_added bindings_removed
                      exchanges_added exchanges_removed
                      queues_added queues_removed
@@ -292,6 +293,132 @@ module Stress
             sleep Random.rand(100..500).milliseconds
           end
         end
+      end
+    end
+  end
+
+  # -------- Confirm-mode producers --------
+  #
+  # The block form of `basic_publish` puts the channel in confirm mode and
+  # invokes the block when the broker's confirm arrives. We use a buffered
+  # `Channel(Bool)` plus Crystal's `select`/`timeout` to bound the wait —
+  # `amqp-client`'s `basic_publish_confirm` sleeps unbounded, which is fine
+  # for normal use but defeats the point in a stress driver where we want
+  # to *see* timeouts. On channel/connection close, pending callbacks fire
+  # with `false`, which we count as nacks.
+
+  CONFIRM_TIMEOUT       = 5.seconds
+  BATCH_CONFIRM_SIZE    = 100
+  BATCH_CONFIRM_TIMEOUT = 10.seconds
+
+  private def self.confirm_routing(kind : Symbol) : {String, Properties}
+    rkey = case kind
+           when :topic  then TOPIC_KEYS.sample
+           when :direct then "main"
+           else              ""
+           end
+    props = if kind == :headers
+              Properties.new(delivery_mode: 1_u8, headers: Arguments.new({
+                "type" => HEADER_TYPES.sample.as(AMQ::Protocol::Field),
+              }))
+            else
+              Properties.new(delivery_mode: 1_u8)
+            end
+    {rkey, props}
+  end
+
+  # Synchronous confirmer: publish one, wait up to CONFIRM_TIMEOUT for the
+  # confirm, count ack/nack/timeout. Runs against the same exchanges as the
+  # fire-and-forget producers so confirm-mode and non-confirm-mode channels
+  # race on Q_MAIN.
+  def self.confirm_producer(id : Int32, exchange : String, kind : Symbol)
+    with_amqp("conf-#{kind}-#{id}") do |conn|
+      ch = conn.channel
+      seq = 0_u64
+      while !STOP.get && !ch.closed?
+        seq &+= 1
+        rkey, props = confirm_routing(kind)
+        body = "conf-#{kind}-#{id}-#{seq}"
+        result = ::Channel(Bool).new(1)
+        ch.basic_publish(body, exchange, rkey, props: props) do |ok|
+          result.send(ok) rescue nil
+        end
+        STATS.incr_published
+        select
+        when ok = result.receive
+          if ok
+            STATS.incr_confirmed
+          elsif ch.closed? || conn.closed?
+            # cleanup() fires every pending callback with false on
+            # channel/connection teardown — not a real nack
+            STATS.incr_confirm_disconnects
+          else
+            STATS.incr_confirm_nacked
+            Log.warn { "[conf-#{kind}-#{id}] nack seq=#{seq}" }
+          end
+        when timeout(CONFIRM_TIMEOUT)
+          STATS.incr_confirm_timeouts
+          Log.warn { "[conf-#{kind}-#{id}] confirm timeout seq=#{seq}" }
+        end
+      end
+    end
+  end
+
+  # Batched confirmer: publish BATCH_CONFIRM_SIZE without waiting between
+  # them, then drain the confirm callbacks with a total deadline. Each
+  # arriving confirm is counted individually; messages whose confirm never
+  # shows up before the deadline are counted as timeouts.
+  def self.batch_confirm_producer(id : Int32, exchange : String, kind : Symbol)
+    with_amqp("bconf-#{kind}-#{id}") do |conn|
+      ch = conn.channel
+      seq = 0_u64
+      while !STOP.get && !ch.closed?
+        ack_chan = ::Channel(Bool).new(BATCH_CONFIRM_SIZE)
+        published = 0
+        BATCH_CONFIRM_SIZE.times do
+          break if STOP.get || ch.closed?
+          seq &+= 1
+          rkey, props = confirm_routing(kind)
+          body = "bconf-#{kind}-#{id}-#{seq}"
+          ch.basic_publish(body, exchange, rkey, props: props) do |ok|
+            ack_chan.send(ok) rescue nil
+          end
+          STATS.incr_published
+          published += 1
+        end
+        next if published == 0
+        received = 0
+        deadline = Time.instant + BATCH_CONFIRM_TIMEOUT
+        while received < published && !STOP.get
+          remaining = deadline - Time.instant
+          break if remaining <= Time::Span.zero
+          select
+          when ok = ack_chan.receive
+            received += 1
+            if ok
+              STATS.incr_confirmed
+            elsif ch.closed? || conn.closed?
+              STATS.incr_confirm_disconnects
+            else
+              STATS.incr_confirm_nacked
+            end
+          when timeout(remaining)
+            break
+          end
+        end
+        missing = published - received
+        if missing > 0
+          # Don't warn if we already know the connection died — that explains
+          # the missing confirms (cleanup() drains the pending deque but our
+          # already-timed-out `select` no longer sees them).
+          if ch.closed? || conn.closed?
+            STATS.incr_confirm_disconnects(by: missing.to_i64)
+          else
+            STATS.incr_confirm_timeouts(by: missing.to_i64)
+            Log.warn { "[bconf-#{kind}-#{id}] #{missing}/#{published} confirms missing after #{BATCH_CONFIRM_TIMEOUT}" }
+          end
+        end
+        STATS.incr_batch_confirm_cycles
       end
     end
   end
@@ -902,6 +1029,7 @@ module Stress
       stuck_marker = stuck >= 10 ? " STUCK=#{stuck.to_i}s" : ""
       log_info(
         "pub=#{STATS.published} ack=#{STATS.acked} rej=#{STATS.rejected} dlx=#{STATS.dead_lettered} " \
+        "conf=#{STATS.confirmed}/n#{STATS.confirm_nacked}/t#{STATS.confirm_timeouts}/d#{STATS.confirm_disconnects}(b=#{STATS.batch_confirm_cycles}) " \
         "get=#{STATS.get_ok}/#{STATS.get_empty} " \
         "str=#{STATS.stream_published}/#{STATS.stream_acked}/#{STATS.stream_consumer_cycles} " \
         "ex+/-=#{STATS.exchanges_added}/#{STATS.exchanges_removed} " \
@@ -932,6 +1060,12 @@ module Stress
                else        :bursty
                end
         spawn(name: "prod-#{kind}-#{mode}-#{i}") { producer(i, ex, mode.as(Symbol), kind.as(Symbol)) }
+      end
+      [c // 2, 1].max.times do |i|
+        spawn(name: "conf-#{kind}-#{i}") { confirm_producer(i, ex, kind.as(Symbol)) }
+      end
+      [c // 2, 1].max.times do |i|
+        spawn(name: "bconf-#{kind}-#{i}") { batch_confirm_producer(i, ex, kind.as(Symbol)) }
       end
     end
 
@@ -1032,6 +1166,11 @@ module Stress
     log_info(
       "  published=#{STATS.published} acked=#{STATS.acked} rejected=#{STATS.rejected} " \
       "dead_lettered=#{STATS.dead_lettered}"
+    )
+    log_info(
+      "  confirmed=#{STATS.confirmed} nacked=#{STATS.confirm_nacked} " \
+      "timeouts=#{STATS.confirm_timeouts} disconnects=#{STATS.confirm_disconnects} " \
+      "batch_cycles=#{STATS.batch_confirm_cycles}"
     )
     log_info(
       "  stream pub=#{STATS.stream_published} ack=#{STATS.stream_acked} " \
