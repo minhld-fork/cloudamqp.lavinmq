@@ -202,6 +202,11 @@ module LavinMQ
       abstract def bindings_details : Array(BindingDetails)
       abstract def each_destination(routing_key : String, headers : AMQP::Table?, & : LavinMQ::Destination ->)
 
+      # SIGUSR1 debug-dump helper: returns the fiber currently holding the
+      # write side of `@bindings`, if any. Subclasses each own their own
+      # `@bindings : Sync::Shared(...)`.
+      abstract def bindings_lock_holder : Fiber?
+
       def publish(msg : Message, immediate : Bool,
                   queues : Set(LavinMQ::Queue) = Set(LavinMQ::Queue).new,
                   exchanges : Set(LavinMQ::Exchange) = Set(LavinMQ::Exchange).new) : Bool
