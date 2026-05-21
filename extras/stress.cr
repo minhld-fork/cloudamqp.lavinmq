@@ -58,6 +58,8 @@ module Stress
                      channels_opened channels_closed
                      http_publishes http_lists http_conn_kills
                      stream_published stream_acked stream_consumer_cycles
+                     fed_ex_published fed_ex_received fed_q_published fed_q_received
+                     fed_links_added fed_links_removed fed_churn_cycles
                      purges errors
                    ) %}
       @{{name.id}} = Atomic(Int64).new(0_i64)
@@ -104,6 +106,26 @@ module Stress
 
   TOPIC_KEYS   = %w(a.b.c a.b.d a.x.y x.b.c k.l.m foo.bar foo.baz hot.cold ping.pong red.green.blue)
   HEADER_TYPES = %w(a b c d)
+
+  # Federation topology. Two extra vhosts ("a" and "b") each carrying a
+  # topic exchange and two queues — one bound to the exchange for exchange
+  # federation, one stand-alone for queue federation. Each vhost has an
+  # upstream pointing at the other so the wiring is bidirectional. Policies
+  # attach the upstream to the local exchange/queue. max-hops=1 on the
+  # exchange upstream prevents republish loops.
+  FED_VHOSTS = {:a => "stress-fed-a", :b => "stress-fed-b"}
+  FED_EX     = "fed.ex"
+  FED_Q      = "fed.q"
+  FED_QF     = "fed.qf"
+
+  record FedUpstream, downstream : Symbol, upstream : Symbol, name : String, kind : Symbol
+
+  FED_UPSTREAMS = [
+    FedUpstream.new(:a, :b, "from-b-ex", :exchange),
+    FedUpstream.new(:a, :b, "from-b-q", :queue),
+    FedUpstream.new(:b, :a, "from-a-ex", :exchange),
+    FedUpstream.new(:b, :a, "from-a-q", :queue),
+  ]
 
   def self.log_info(msg)
     STDERR.puts "[stress] #{Time.utc.to_s("%H:%M:%S")} #{msg}"
@@ -159,6 +181,10 @@ module Stress
 
   def self.vhost_path(vhost : String = CFG.vhost) : String
     URI.encode_path_segment(vhost)
+  end
+
+  def self.amqp_url_for(vhost : String) : String
+    "amqp://#{CFG.user}:#{CFG.password}@#{CFG.host}:#{CFG.amqp_port}/#{URI.encode_path_segment(vhost)}"
   end
 
   # -------- Topology setup --------
@@ -219,6 +245,85 @@ module Stress
       end
     end
     log_info "Topology ready"
+
+    setup_federation_topology
+  end
+
+  def self.setup_federation_topology
+    FED_VHOSTS.each_value do |vh|
+      case code = http_put("/api/vhosts/#{vhost_path(vh)}")
+      when 201, 204
+        log_info "Created vhost #{vh}"
+      else
+        log_info "Vhost #{vh} create returned #{code} (probably already exists)"
+      end
+      perm_body = %({"configure":".*","write":".*","read":".*"})
+      http_put("/api/permissions/#{vhost_path(vh)}/#{URI.encode_path_segment(CFG.user)}", perm_body)
+
+      AMQP::Client.start(amqp_url_for(vh)) do |conn|
+        ch = conn.channel
+        ch.exchange_declare FED_EX, "topic", durable: true
+        ch.queue_declare FED_Q, durable: true
+        ch.queue_bind FED_Q, FED_EX, "#"
+        ch.queue_declare FED_QF, durable: true
+      end
+    end
+
+    FED_UPSTREAMS.each do |u|
+      put_fed_upstream(FED_VHOSTS[u.downstream], FED_VHOSTS[u.upstream], u.name, u.kind)
+      STATS.incr_fed_links_added
+    end
+
+    # One policy per (vhost, kind). Matches the local resource and binds it
+    # to the upstream parameter named above.
+    FED_VHOSTS.each do |key, vh|
+      upstream_ex_name = key == :a ? "from-b-ex" : "from-a-ex"
+      upstream_q_name = key == :a ? "from-b-q" : "from-a-q"
+      put_fed_policy(vh, "fed-ex-policy", "^#{Regex.escape(FED_EX)}$", "exchanges", upstream_ex_name)
+      put_fed_policy(vh, "fed-q-policy", "^#{Regex.escape(FED_QF)}$", "queues", upstream_q_name)
+    end
+
+    log_info "Federation ready"
+  end
+
+  def self.put_fed_upstream(downstream_vhost : String, upstream_vhost : String, name : String, kind : Symbol) : Int32
+    body = JSON.build do |json|
+      json.object do
+        json.field "value" do
+          json.object do
+            json.field "uri", amqp_url_for(upstream_vhost)
+            json.field "ack-mode", "on-confirm"
+            json.field "reconnect-delay", 1
+            json.field "prefetch-count", 100
+            case kind
+            when :exchange
+              json.field "exchange", FED_EX
+              json.field "max-hops", 1
+            when :queue
+              json.field "queue", FED_QF
+            end
+          end
+        end
+      end
+    end
+    path = "/api/parameters/federation-upstream/#{vhost_path(downstream_vhost)}/#{URI.encode_path_segment(name)}"
+    http_put(path, body)
+  end
+
+  def self.put_fed_policy(vhost : String, policy_name : String, pattern : String, apply_to : String, upstream_name : String) : Int32
+    body = JSON.build do |json|
+      json.object do
+        json.field "pattern", pattern
+        json.field "apply-to", apply_to
+        json.field "priority", 20
+        json.field "definition" do
+          json.object do
+            json.field "federation-upstream", upstream_name
+          end
+        end
+      end
+    end
+    http_put("/api/policies/#{vhost_path(vhost)}/#{URI.encode_path_segment(policy_name)}", body)
   end
 
   # -------- Worker base helpers --------
@@ -235,10 +340,10 @@ module Stress
     end
   end
 
-  def self.with_amqp(name : String, &)
+  def self.with_amqp(name : String, url : String = CFG.amqp_url, &)
     until STOP.get
       begin
-        AMQP::Client.start(CFG.amqp_url) do |conn|
+        AMQP::Client.start(url) do |conn|
           STATS.incr_connections_opened
           yield conn
           STATS.incr_connections_closed
@@ -1007,6 +1112,106 @@ module Stress
     end
   end
 
+  # -------- Federation workers --------
+  #
+  # Each fiber picks one side (vhost A or B) and stays there — alternation
+  # comes from spawning workers for both sides. Producers publish to the
+  # local `fed.ex` / `fed.qf`; consumers drain the local `fed.q` / `fed.qf`
+  # on the opposite side. With bidirectional upstreams that means a message
+  # published in vhost A appears on the federated resource in vhost B and
+  # vice versa.
+
+  def self.federation_exchange_producer(id : Int32, vhost_key : Symbol)
+    vh = FED_VHOSTS[vhost_key]
+    with_amqp("fed-ex-prod-#{vhost_key}-#{id}", amqp_url_for(vh)) do |conn|
+      ch = conn.channel
+      seq = 0_u64
+      while !STOP.get && !ch.closed?
+        seq &+= 1
+        ch.basic_publish("fed-ex-#{vh}-#{id}-#{seq}", FED_EX, TOPIC_KEYS.sample,
+          props: Properties.new(delivery_mode: 1_u8))
+        STATS.incr_fed_ex_published
+        sleep Random.rand(5..30).milliseconds
+      end
+    end
+  end
+
+  def self.federation_exchange_consumer(id : Int32, vhost_key : Symbol)
+    vh = FED_VHOSTS[vhost_key]
+    with_amqp("fed-ex-cons-#{vhost_key}-#{id}", amqp_url_for(vh)) do |conn|
+      ch = conn.channel
+      ch.prefetch(count: 50)
+      tag = "fed-ex-cons-#{vh}-#{id}-#{Random.rand(1_000_000)}"
+      ch.basic_consume(FED_Q, tag: tag, no_ack: false, block: false) do |msg|
+        begin
+          msg.ack
+          STATS.incr_fed_ex_received
+        rescue
+          STATS.incr_errors
+        end
+      end
+      until STOP.get || ch.closed? || conn.closed?
+        sleep 200.milliseconds
+      end
+      ch.basic_cancel(tag) rescue nil
+    end
+  end
+
+  def self.federation_queue_producer(id : Int32, vhost_key : Symbol)
+    vh = FED_VHOSTS[vhost_key]
+    with_amqp("fed-q-prod-#{vhost_key}-#{id}", amqp_url_for(vh)) do |conn|
+      ch = conn.channel
+      seq = 0_u64
+      while !STOP.get && !ch.closed?
+        seq &+= 1
+        ch.basic_publish("fed-q-#{vh}-#{id}-#{seq}", "", FED_QF,
+          props: Properties.new(delivery_mode: 1_u8))
+        STATS.incr_fed_q_published
+        sleep Random.rand(5..30).milliseconds
+      end
+    end
+  end
+
+  def self.federation_queue_consumer(id : Int32, vhost_key : Symbol)
+    vh = FED_VHOSTS[vhost_key]
+    with_amqp("fed-q-cons-#{vhost_key}-#{id}", amqp_url_for(vh)) do |conn|
+      ch = conn.channel
+      ch.prefetch(count: 50)
+      tag = "fed-q-cons-#{vh}-#{id}-#{Random.rand(1_000_000)}"
+      ch.basic_consume(FED_QF, tag: tag, no_ack: false, block: false) do |msg|
+        begin
+          msg.ack
+          STATS.incr_fed_q_received
+        rescue
+          STATS.incr_errors
+        end
+      end
+      until STOP.get || ch.closed? || conn.closed?
+        sleep 200.milliseconds
+      end
+      ch.basic_cancel(tag) rescue nil
+    end
+  end
+
+  # Periodically tear down an upstream parameter and re-create it. Exercises
+  # the federation link reconnect path (terminate on parameter delete, fresh
+  # link on parameter re-add) while exchange/queue federation traffic is in
+  # flight.
+  def self.federation_churn(id : Int32)
+    run_until_stop("fed-churn-#{id}", sleep_on_error: 500.milliseconds) do
+      u = FED_UPSTREAMS.sample
+      downstream = FED_VHOSTS[u.downstream]
+      upstream = FED_VHOSTS[u.upstream]
+      del_path = "/api/parameters/federation-upstream/#{vhost_path(downstream)}/#{URI.encode_path_segment(u.name)}"
+      STATS.incr_fed_links_removed if http_delete(del_path) == 204
+      sleep Random.rand(100..400).milliseconds
+      code = put_fed_upstream(downstream, upstream, u.name, u.kind)
+      STATS.incr_fed_links_added if code == 201 || code == 204
+      STATS.incr_fed_churn_cycles
+      sleep Random.rand(500..2000).milliseconds
+    end
+  end
+
   # -------- Liveness reporter --------
 
   def self.liveness_reporter
@@ -1032,6 +1237,9 @@ module Stress
         "conf=#{STATS.confirmed}/n#{STATS.confirm_nacked}/t#{STATS.confirm_timeouts}/d#{STATS.confirm_disconnects}(b=#{STATS.batch_confirm_cycles}) " \
         "get=#{STATS.get_ok}/#{STATS.get_empty} " \
         "str=#{STATS.stream_published}/#{STATS.stream_acked}/#{STATS.stream_consumer_cycles} " \
+        "fed_ex=#{STATS.fed_ex_published}/#{STATS.fed_ex_received} " \
+        "fed_q=#{STATS.fed_q_published}/#{STATS.fed_q_received} " \
+        "fed_ln+/-=#{STATS.fed_links_added}/#{STATS.fed_links_removed}(c=#{STATS.fed_churn_cycles}) " \
         "ex+/-=#{STATS.exchanges_added}/#{STATS.exchanges_removed} " \
         "q+/-=#{STATS.queues_added}/#{STATS.queues_removed} " \
         "bnd+/-=#{STATS.bindings_added}/#{STATS.bindings_removed} " \
@@ -1119,6 +1327,19 @@ module Stress
     [c // 2, 1].max.times { |i| spawn(name: "strc-#{i}") { stream_consumer(i) } }
     [c // 2, 1].max.times { |i| spawn(name: "strc-churn-#{i}") { stream_consumer_churn(i) } }
 
+    # Federation workers. Symmetric across the two fed vhosts so messages
+    # flow both directions through the bidirectional upstreams.
+    fed_per_side = [c // 2, 1].max
+    FED_VHOSTS.each_key do |key|
+      fed_per_side.times do |i|
+        spawn(name: "fed-ex-prod-#{key}-#{i}") { federation_exchange_producer(i, key) }
+        spawn(name: "fed-ex-cons-#{key}-#{i}") { federation_exchange_consumer(i, key) }
+        spawn(name: "fed-q-prod-#{key}-#{i}") { federation_queue_producer(i, key) }
+        spawn(name: "fed-q-cons-#{key}-#{i}") { federation_queue_consumer(i, key) }
+      end
+    end
+    [c // 4, 1].max.times { |i| spawn(name: "fed-churn-#{i}") { federation_churn(i) } }
+
     # HTTP workers
     [c // 2, 1].max.times { |i| spawn(name: "vhost-churn-#{i}") { vhost_churn(i) } }
     [c // 4, 1].max.times { |i| spawn(name: "conn-kill-#{i}") { connection_killer(i) } }
@@ -1175,6 +1396,11 @@ module Stress
     log_info(
       "  stream pub=#{STATS.stream_published} ack=#{STATS.stream_acked} " \
       "consumer_cycles=#{STATS.stream_consumer_cycles}"
+    )
+    log_info(
+      "  federation ex pub=#{STATS.fed_ex_published} rcv=#{STATS.fed_ex_received} " \
+      "q pub=#{STATS.fed_q_published} rcv=#{STATS.fed_q_received} " \
+      "links +#{STATS.fed_links_added}/-#{STATS.fed_links_removed} churn=#{STATS.fed_churn_cycles}"
     )
     log_info(
       "  exchanges +#{STATS.exchanges_added}/-#{STATS.exchanges_removed} " \
