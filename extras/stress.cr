@@ -58,8 +58,11 @@ module Stress
                      channels_opened channels_closed
                      http_publishes http_lists http_conn_kills
                      stream_published stream_acked stream_consumer_cycles
+                     stream_varied_consumer_cycles stream_filtered_consumer_cycles
+                     stream_filtered_received
                      fed_ex_published fed_ex_received fed_q_published fed_q_received
                      fed_links_added fed_links_removed fed_churn_cycles
+                     queues_paused queues_resumed
                      purges errors
                    ) %}
       @{{name.id}} = Atomic(Int64).new(0_i64)
@@ -103,6 +106,11 @@ module Stress
   #      bytes to the offsets file regardless of whether the tag is new.
   STREAM_PAYLOAD_SIZE     = 512
   STREAM_MAX_LENGTH_BYTES = 8 * 1024 * 1024
+
+  # Filter values stamped on a fraction of stream messages via the
+  # `x-stream-filter-value` header. The set is intentionally small so
+  # filtered consumers actually match some messages.
+  STREAM_FILTER_VALUES = %w(v1 v2 v3 v4 v5)
 
   TOPIC_KEYS   = %w(a.b.c a.b.d a.x.y x.b.c k.l.m foo.bar foo.baz hot.cold ping.pong red.green.blue)
   HEADER_TYPES = %w(a b c d)
@@ -847,7 +855,17 @@ module Stress
       seq = 0_u64
       while !STOP.get && !ch.closed?
         seq &+= 1
-        ch.basic_publish(STREAM_PAYLOAD, "", Q_STREAM, props: Properties.new(delivery_mode: 1_u8))
+        # ~50% of messages carry an x-stream-filter-value so filtered
+        # consumers have something to match against. Plain consumers
+        # ignore the header.
+        props = if Random.rand(2) == 0
+                  Properties.new(delivery_mode: 1_u8, headers: Arguments.new({
+                    "x-stream-filter-value" => STREAM_FILTER_VALUES.sample.as(AMQ::Protocol::Field),
+                  }))
+                else
+                  Properties.new(delivery_mode: 1_u8)
+                end
+        ch.basic_publish(STREAM_PAYLOAD, "", Q_STREAM, props: props)
         STATS.incr_stream_published
         # Throttle to keep the stream from crowding out the rest of the
         # stress workload. Even "fast" yields every 50 msgs.
@@ -937,6 +955,160 @@ module Stress
         STATS.incr_errors
       end
       sleep Random.rand(20..100).milliseconds unless STOP.get
+    end
+  end
+
+  # Pick a randomized `x-stream-offset` value plus a random
+  # `x-stream-automatic-offset-tracking` setting. Exercises every branch
+  # of `StreamMessageStore#find_offset`: named ("first"/"last"/"next"),
+  # numeric (in-range, negative, past-end), and timestamp.
+  private def self.random_stream_offset_args : Arguments
+    args = Arguments.new
+    case Random.rand(8)
+    when 0
+      args["x-stream-offset"] = "first".as(AMQ::Protocol::Field)
+    when 1
+      args["x-stream-offset"] = "last".as(AMQ::Protocol::Field)
+    when 2
+      args["x-stream-offset"] = "next".as(AMQ::Protocol::Field)
+    when 3
+      # In-range numeric offset
+      args["x-stream-offset"] = Random.rand(0_i64..10_000_i64).as(AMQ::Protocol::Field)
+    when 4
+      # Negative offset — server falls back to first available segment
+      args["x-stream-offset"] = (-Random.rand(1_i64..1_000_i64)).as(AMQ::Protocol::Field)
+    when 5
+      # Offset far past the tail — maps to "next"-like behavior
+      args["x-stream-offset"] = (1_000_000_000_i64 + Random.rand(0_i64..1_000_000_i64)).as(AMQ::Protocol::Field)
+    when 6
+      # Timestamp in the recent past
+      ts = Time.utc - Random.rand(0..120).seconds
+      args["x-stream-offset"] = ts.as(AMQ::Protocol::Field)
+    else
+      # Older timestamp before the stream existed
+      ts = Time.utc - Random.rand(300..3600).seconds
+      args["x-stream-offset"] = ts.as(AMQ::Protocol::Field)
+    end
+    # Mix in automatic offset tracking on/off, sometimes as the string
+    # form "true"/"false" which the server also accepts.
+    case Random.rand(4)
+    when 0 then args["x-stream-automatic-offset-tracking"] = true.as(AMQ::Protocol::Field)
+    when 1 then args["x-stream-automatic-offset-tracking"] = false.as(AMQ::Protocol::Field)
+    when 2 then args["x-stream-automatic-offset-tracking"] = "true".as(AMQ::Protocol::Field)
+    else # omitted — server default applies
+    end
+    args
+  end
+
+  # Short-lived consumers that exercise every offset variant on the
+  # stream queue. Each iteration uses a fresh tag and a fresh
+  # offset/tracking combo, then drains for a brief window before
+  # disconnecting.
+  def self.stream_varied_offset_consumer(id : Int32)
+    cycle = 0_u64
+    until STOP.get
+      cycle &+= 1
+      tag = "#{STREAM_TAG_PREFIX}varied-#{id}-#{cycle}-#{Random.rand(1_000_000_000)}"
+      args = random_stream_offset_args
+      begin
+        AMQP::Client.start(CFG.amqp_url) do |conn|
+          STATS.incr_connections_opened
+          ch = conn.channel
+          ch.prefetch(count: Random.rand(10..100))
+          got = Atomic(Int32).new(0)
+          ch.basic_consume(Q_STREAM, tag: tag, no_ack: false, block: false, args: args) do |msg|
+            begin
+              msg.ack
+              got.add(1)
+              STATS.incr_stream_acked
+            rescue
+              STATS.incr_errors
+            end
+          end
+          target = 20 + Random.rand(200)
+          deadline = Time.instant + 2.seconds
+          until STOP.get || got.get >= target || Time.instant >= deadline
+            sleep 20.milliseconds
+          end
+          ch.basic_cancel(tag) rescue nil
+          STATS.incr_stream_varied_consumer_cycles
+          STATS.incr_connections_closed
+        end
+      rescue
+        STATS.incr_errors
+      end
+      sleep Random.rand(20..150).milliseconds unless STOP.get
+    end
+  end
+
+  # Filtered stream consumers. Picks 1-3 filter values from the producer
+  # set, randomly chooses 'any' vs 'all' match semantics, and either
+  # opts in to x-stream-match-unfiltered (delivering messages without
+  # a filter header) or not. Combined with the varied offset args this
+  # exercises the StreamFilter / KV / XStreamFilter parse and match
+  # paths under churn.
+  def self.stream_filtered_consumer(id : Int32)
+    cycle = 0_u64
+    until STOP.get
+      cycle &+= 1
+      tag = "#{STREAM_TAG_PREFIX}filtered-#{id}-#{cycle}-#{Random.rand(1_000_000_000)}"
+      n_values = 1 + Random.rand(3)
+      values = STREAM_FILTER_VALUES.sample(n_values)
+      args = random_stream_offset_args
+      args["x-stream-filter"] = values.join(",").as(AMQ::Protocol::Field)
+      args["x-filter-match-type"] = (Random.rand(2) == 0 ? "any" : "all").as(AMQ::Protocol::Field)
+      args["x-stream-match-unfiltered"] = (Random.rand(2) == 0).as(AMQ::Protocol::Field)
+      begin
+        AMQP::Client.start(CFG.amqp_url) do |conn|
+          STATS.incr_connections_opened
+          ch = conn.channel
+          ch.prefetch(count: Random.rand(10..100))
+          got = Atomic(Int32).new(0)
+          ch.basic_consume(Q_STREAM, tag: tag, no_ack: false, block: false, args: args) do |msg|
+            begin
+              msg.ack
+              got.add(1)
+              STATS.incr_stream_filtered_received
+            rescue
+              STATS.incr_errors
+            end
+          end
+          target = 20 + Random.rand(200)
+          deadline = Time.instant + 2.seconds
+          until STOP.get || got.get >= target || Time.instant >= deadline
+            sleep 20.milliseconds
+          end
+          ch.basic_cancel(tag) rescue nil
+          STATS.incr_stream_filtered_consumer_cycles
+          STATS.incr_connections_closed
+        end
+      rescue
+        STATS.incr_errors
+      end
+      sleep Random.rand(20..150).milliseconds unless STOP.get
+    end
+  end
+
+  # -------- Queue pause / resume churn --------
+  #
+  # Pause a live queue via HTTP, leave it paused briefly while producers
+  # pile messages onto it, then resume. Targets the named queues plus
+  # the noise pool so consumers and pollers race the pause/resume
+  # transitions.
+  def self.queue_pause_churn(id : Int32)
+    run_until_stop("q-pause-#{id}", sleep_on_error: 200.milliseconds) do
+      target = case Random.rand(5)
+               when 0 then Q_MAIN
+               when 1 then Q_DLQ
+               when 2 then Q_POLL
+               when 3 then Q_STREAM
+               else        "stress.noise.#{Random.rand(NOISE_QUEUES)}"
+               end
+      path = "/api/queues/#{vhost_path}/#{URI.encode_path_segment(target)}"
+      STATS.incr_queues_paused if http_put("#{path}/pause") == 204
+      sleep Random.rand(50..400).milliseconds
+      STATS.incr_queues_resumed if http_put("#{path}/resume") == 204
+      sleep Random.rand(100..600).milliseconds
     end
   end
 
@@ -1237,6 +1409,9 @@ module Stress
         "conf=#{STATS.confirmed}/n#{STATS.confirm_nacked}/t#{STATS.confirm_timeouts}/d#{STATS.confirm_disconnects}(b=#{STATS.batch_confirm_cycles}) " \
         "get=#{STATS.get_ok}/#{STATS.get_empty} " \
         "str=#{STATS.stream_published}/#{STATS.stream_acked}/#{STATS.stream_consumer_cycles} " \
+        "str_var=#{STATS.stream_varied_consumer_cycles} " \
+        "str_flt=#{STATS.stream_filtered_received}/#{STATS.stream_filtered_consumer_cycles} " \
+        "q_pause+/-=#{STATS.queues_paused}/#{STATS.queues_resumed} " \
         "fed_ex=#{STATS.fed_ex_published}/#{STATS.fed_ex_received} " \
         "fed_q=#{STATS.fed_q_published}/#{STATS.fed_q_received} " \
         "fed_ln+/-=#{STATS.fed_links_added}/#{STATS.fed_links_removed}(c=#{STATS.fed_churn_cycles}) " \
@@ -1313,6 +1488,7 @@ module Stress
 
     # Purge churn
     [c // 4, 1].max.times { |i| spawn(name: "purge-#{i}") { purge_churn(i) } }
+    [c // 4, 1].max.times { |i| spawn(name: "q-pause-#{i}") { queue_pause_churn(i) } }
 
     # Stream workers: producers fill segments, long-lived consumers track
     # offsets, churners cycle through fresh tags to fill the offsets file.
@@ -1326,6 +1502,8 @@ module Stress
     end
     [c // 2, 1].max.times { |i| spawn(name: "strc-#{i}") { stream_consumer(i) } }
     [c // 2, 1].max.times { |i| spawn(name: "strc-churn-#{i}") { stream_consumer_churn(i) } }
+    [c // 2, 1].max.times { |i| spawn(name: "strc-varied-#{i}") { stream_varied_offset_consumer(i) } }
+    [c // 2, 1].max.times { |i| spawn(name: "strc-filtered-#{i}") { stream_filtered_consumer(i) } }
 
     # Federation workers. Symmetric across the two fed vhosts so messages
     # flow both directions through the bidirectional upstreams.
@@ -1395,7 +1573,12 @@ module Stress
     )
     log_info(
       "  stream pub=#{STATS.stream_published} ack=#{STATS.stream_acked} " \
-      "consumer_cycles=#{STATS.stream_consumer_cycles}"
+      "consumer_cycles=#{STATS.stream_consumer_cycles} " \
+      "varied_cycles=#{STATS.stream_varied_consumer_cycles} " \
+      "filtered=#{STATS.stream_filtered_received}/#{STATS.stream_filtered_consumer_cycles}"
+    )
+    log_info(
+      "  queues paused/resumed=#{STATS.queues_paused}/#{STATS.queues_resumed}"
     )
     log_info(
       "  federation ex pub=#{STATS.fed_ex_published} rcv=#{STATS.fed_ex_received} " \
