@@ -676,7 +676,7 @@ module LavinMQ
       end
 
       def close
-        @running.set(false, :release)
+        return unless @running.swap(false, :acquire_release)
         @consumers.shared(&.dup).each_with_index(1) do |consumer, i|
           consumer.close
           Fiber.yield if (i % 128) == 0
